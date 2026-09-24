@@ -1,0 +1,382 @@
+{
+  "schema_version": "2.0",
+  "name": "MiniMax H3 MASTER WORKFLOW - 2x RTX 3090 24GB + 128GB RAM",
+  "kind": "persistent_master_workflow_profile",
+  "important_note": "To jest master JSON do trwałej konfiguracji i budowy workflow w ComfyUI. Nie udaje surowego canvas-exportu ComfyUI, ponieważ aktualne custom nodes MiniMax H3 Multi-GPU i H3 AudioRefine rozwijają się szybko i mają własne gotowe graph JSON-y. Ten plik definiuje dokładne profile, modele, start, wiring, zakazy i decyzje pod 2x3090.",
+  "target_hardware": {
+    "gpu": [
+      {
+        "id": 0,
+        "model": "RTX 3090",
+        "vram_gb": 24
+      },
+      {
+        "id": 1,
+        "model": "RTX 3090",
+        "vram_gb": 24
+      }
+    ],
+    "system_ram_gb": 128,
+    "goal": "maksymalna jakość i stabilność przy realnym wykorzystaniu obu GPU",
+    "psu_and_thermals": {
+      "policy": "stock clocks / stock board power unless user has already validated cooling and PSU",
+      "overclock": false,
+      "reason": "OC nie poprawia jakości i może psuć długie kolejki renderów; najpierw stabilność."
+    }
+  },
+  "platform": {
+    "preferred": "Linux",
+    "windows": "WSL2 only for true NCCL multi-GPU",
+    "native_windows_multi_gpu_sp": false,
+    "comfyui_minimum": "0.30.0",
+    "recommended": "current stable/nightly compatible with installed H3 custom nodes"
+  },
+  "install": {
+    "custom_nodes": [
+      {
+        "name": "buqi-minimax-h3-multigpu",
+        "purpose": "prawdziwy 2-GPU Ulysses sequence parallel dla DiT",
+        "repo": "https://github.com/buqi-code/buqi-minimax-h3-multigpu.git",
+        "required_for_main_profile": true
+      },
+      {
+        "name": "ComfyUI-H3-AudioRefine",
+        "purpose": "opcjonalny szybki profil Turbo + dodatkowe kroki audio",
+        "repo": "https://github.com/Adudeguyman/ComfyUI-H3-AudioRefine.git",
+        "required_for_main_profile": false
+      }
+    ],
+    "commands": [
+      "cd ComfyUI/custom_nodes",
+      "git clone https://github.com/buqi-code/buqi-minimax-h3-multigpu.git",
+      "git clone https://github.com/Adudeguyman/ComfyUI-H3-AudioRefine.git"
+    ]
+  },
+  "models": {
+    "main_fl2va": {
+      "file": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+      "folder": "ComfyUI/models/diffusion_models/",
+      "why": "21GB; multi-GPU loader recommends FP8 and 24GB cards need the headroom.",
+      "use_for": [
+        "T2V",
+        "I2V",
+        "first-last-frame"
+      ]
+    },
+    "ref2va_optional": {
+      "file": "minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
+      "folder": "ComfyUI/models/diffusion_models/",
+      "why": "R2V uses a different checkpoint; do not interchange with FL2VA."
+    },
+    "text_encoder": {
+      "file": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "folder": "ComfyUI/models/text_encoders/"
+    },
+    "video_vae": {
+      "file": "minimax_h3_video_vae_fp16.safetensors",
+      "folder": "ComfyUI/models/vae/"
+    },
+    "audio_vae": {
+      "file": "minimax_h3_audio_vae_fp32.safetensors",
+      "folder": "ComfyUI/models/vae/"
+    },
+    "turbo_loras_optional": {
+      "fl2v_4step_768p": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+      "fl2v_8step": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+      "ref2v_4step": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+      "folder": "ComfyUI/models/loras/"
+    }
+  },
+  "launch": {
+    "environment": {
+      "MINIMAX_SP_DEVICES": "0,1",
+      "MINIMAX_SP_AG_CHUNKS": "4",
+      "MINIMAX_SP_ATTN_CHUNKS": "4",
+      "MINIMAX_SP_PROFILE": "0",
+      "MINIMAX_SP_PROFILE_OPS": "0"
+    },
+    "command": "python main.py --cuda-device 0,1 --highvram",
+    "debug_command": "MINIMAX_SP_PROFILE=1 MINIMAX_SP_PROFILE_OPS=1 python main.py --cuda-device 0,1 --highvram",
+    "do_not_add_by_default": [
+      "--disable-pinned-memory",
+      "--cuda-device 0",
+      "--lowvram",
+      "--novram"
+    ],
+    "conditional_fix": {
+      "--disable-pinned-memory": "Włącz tylko jeżeli RAM/pinned memory rośnie z renderu na render albo pojawiają się CUDA allocation/OOM mimo wolnej pamięci. Potrafi spowolnić transfery."
+    }
+  },
+  "multi_gpu": {
+    "loader_node": {
+      "type": "MiniMaxH3SPUNETLoader",
+      "display_name": "MiniMax H3 Multi-GPU Loader (Ulysses SP)",
+      "settings": {
+        "unet_name": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+        "weight_dtype": "fp8",
+        "world_size": 2,
+        "devices": "auto"
+      }
+    },
+    "sequence_parallel": {
+      "enabled": true,
+      "world_size": 2,
+      "expected_characteristic": "około 1.9x denoise speedup w dobrze pasującym workloadzie",
+      "nvlink_required": false
+    },
+    "vae_decode": {
+      "use_multi_gpu_vae_decode": false,
+      "node": "stock VAEDecode",
+      "critical_reason": "MiniMaxH3SPVAEDecode trzyma dodatkowo około 5GB VAE na każdej karcie; z FP8 DiT daje około 26GB/kartę. RTX 3090 ma 24GB, więc na tym zestawie używaj zwykłego VAEDecode."
+    },
+    "restart_required_when_changing": [
+      "checkpoint",
+      "weight_dtype",
+      "world_size"
+    ]
+  },
+  "main_graph_wiring": [
+    "MiniMaxH3SPUNETLoader -> MODEL",
+    "CLIPLoader(minimax, qwen3vl_32b_minimax_h3_nvfp4_awq) -> prompt conditioning",
+    "MiniMax H3 FL2VA/T2VA conditioning/subgraph -> positive conditioning + AV latent",
+    "MODEL + conditioning + sampler/scheduler -> SamplerCustomAdvanced",
+    "sampled AV latent -> stock VIDEO VAEDecode",
+    "sampled AV latent -> AUDIO VAE Decode",
+    "decoded video + decoded audio -> CreateVideo 24fps -> SaveVideo"
+  ],
+  "global_quality_rules": {
+    "default_priority": "quality > speed trick stacking",
+    "single_shot_preferred": true,
+    "closeups_when_face_detail_matters": true,
+    "camera_motion_preferred_over_many_cuts": true,
+    "attention_patch_policy": "Nie dokładaj Sage/ComfyKitchen/Sol-Attn do Ulysses SP jako ustawienia domyślnego, dopóki nie zweryfikujesz zgodności na tej konkretnej wersji node'a. SP już zastępuje ścieżkę attention i daje prawie 2x na dwóch GPU.",
+    "easycache_with_turbo": false,
+    "stack_multiple_accelerators": false,
+    "ab_test_rule": "Każdy speed-up oceniaj na identycznym prompt/seed/resolution/duration względem czystego profilu."
+  },
+  "profiles": {
+    "01_PREVIEW_FAST": {
+      "purpose": "ustawianie promptu, ruchu, timingu, seedów",
+      "model": "FL2VA FP8 + 2GPU SP",
+      "resolution": {
+        "preferred": "832x480",
+        "alternative": "960x544"
+      },
+      "duration_seconds": "4-8",
+      "turbo": {
+        "enabled": true,
+        "preferred_lora": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        "steps": 8,
+        "video_shift": 6,
+        "audio_shift": 3,
+        "strength": 1.0,
+        "reason": "8-step jest bezpieczniejsze dla audio/ruchu niż 4-step."
+      },
+      "sampler": "Euler",
+      "scheduler": "Beta if current graph supports it cleanly; otherwise use Turbo project's documented scheduler",
+      "attention_extra_patch": "OFF by default with SP",
+      "easycache": false,
+      "quality_expectation": "draft only"
+    },
+    "02_PRODUCTION_BALANCED": {
+      "purpose": "codzienny final; mój domyślny profil dla 2x3090",
+      "model": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+      "turbo": false,
+      "resolution": {
+        "preferred": "1280x736",
+        "fallback_if_oom": "1152x672 or 960x544",
+        "experimental_if_stable": "1344x768"
+      },
+      "duration_seconds": "6-12",
+      "steps": 30,
+      "step_range": [
+        24,
+        36
+      ],
+      "sampler": "er_sde or sa_solver",
+      "scheduler": "beta",
+      "cfg": 1.0,
+      "attention_extra_patch": "OFF",
+      "cache": "OFF",
+      "audio_refine": "OFF because full model already gets enough steps",
+      "notes": [
+        "Nie używaj Turbo do finalu, jeśli realizm/twarze/audio są ważne.",
+        "Jeżeli prompt ma wiele akcji, upraszczaj scenę zamiast dokładać akceleratory."
+      ]
+    },
+    "03_PRODUCTION_MAX_QUALITY": {
+      "purpose": "najwyższa jakość i prompt adherence; nocna kolejka",
+      "model": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+      "turbo": false,
+      "resolution": {
+        "preferred": "1280x736",
+        "try_if_memory_allows": "1344x768"
+      },
+      "duration_seconds": "8-15",
+      "steps": 40,
+      "step_range": [
+        35,
+        50
+      ],
+      "sampler": "er_sde",
+      "scheduler": "beta",
+      "cfg": 1.0,
+      "attention_extra_patch": "OFF",
+      "all_approximate_caches": "OFF",
+      "quality_checks": [
+        "skin texture",
+        "teeth/mouth",
+        "hands/anatomy",
+        "prompt action order",
+        "lip sync",
+        "audio noise/tinny artefacts",
+        "flicker"
+      ]
+    },
+    "04_TURBO_AUDIO_REFINE_EXPERIMENTAL": {
+      "purpose": "szybki obraz Turbo + odzyskanie jakości audio",
+      "compatibility_warning": "Frozen Video Cache modyfikuje bloki H3, a Ulysses SP również modyfikuje forward/attention. Nie ma wystarczającego publicznego potwierdzenia, że bieżące wersje działają razem poprawnie. Dlatego nie włączaj Frozen Cache na SP jako domyślnego profilu.",
+      "recommended_execution": {
+        "mode": "separate non-SP workflow/process for AudioRefine until compatibility is verified",
+        "turbo_pass": {
+          "steps": 4,
+          "video_shift": 6,
+          "audio_shift": 3,
+          "lora_strength": 1.0
+        },
+        "refine_branch": {
+          "branch_model_before_turbo_lora": true,
+          "node": "H3 Audio Refine Sampler",
+          "steps": 6,
+          "audio_denoise": 0.5,
+          "video_denoise": 0.0,
+          "sampler": "euler",
+          "scheduler": "simple",
+          "cfg": 1.0
+        },
+        "frozen_video_cache": {
+          "enabled_after_basic_refine_is_stable": true,
+          "preferred_backend": "ram",
+          "cache_contents": "hidden",
+          "precision": "int4",
+          "refresh_interval": 0,
+          "allow_disk": false,
+          "verbose_during_tuning": true,
+          "reason": "128GB RAM daje tu duży zapas; unikaj zużywania SSD."
+        }
+      }
+    }
+  },
+  "resolution_policy": {
+    "must_be_multiple_of_32": true,
+    "good_grids": [
+      "832x480",
+      "960x544",
+      "1280x736",
+      "1344x768 (test memory first)"
+    ],
+    "avoid": [
+      "1280x720 because latent height is not valid for the H3 patch grid"
+    ]
+  },
+  "memory_policy": {
+    "system_ram": {
+      "available_gb": 128,
+      "strategy": "use RAM for optional AudioRefine hidden/int4 cache, not disk",
+      "swap_dependency": "avoid"
+    },
+    "vram": {
+      "per_gpu_gb": 24,
+      "reserve_headroom": true,
+      "do_not_use_sp_vae_decode": true
+    },
+    "disk_cache": {
+      "enabled": false,
+      "reason": "AudioRefine cache can write ~10GB/run depending on clip; unnecessary SSD wear."
+    }
+  },
+  "prompting_policy": {
+    "structure": [
+      "subject / identity",
+      "environment",
+      "single primary action",
+      "camera movement",
+      "lighting/style",
+      "dialogue/audio/SFX"
+    ],
+    "prefer": [
+      "1 shot",
+      "close-up/medium-close-up when face quality matters",
+      "clear temporal order",
+      "camera tricks instead of many hard scene transitions"
+    ],
+    "avoid": [
+      "many unrelated actions in one clip",
+      "many scene cuts under Turbo",
+      "ambiguous ordering"
+    ]
+  },
+  "calibration_protocol": {
+    "do_once_after_install": [
+      {
+        "test": "2GPU_SP_BASELINE",
+        "settings": "832x480, 6s, base FP8, 20 steps, no Turbo/cache/attention patches",
+        "goal": "confirm both GPUs load ~21GB DiT and worker is reused on second run"
+      },
+      {
+        "test": "QUALITY_BASELINE",
+        "settings": "1280x736, same seed, 30 steps, base FP8",
+        "goal": "establish clean reference result"
+      },
+      {
+        "test": "TURBO_AB",
+        "settings": "same prompt/seed at 960x544, 4-step vs 8-step Turbo",
+        "goal": "decide whether 4-step audio is acceptable"
+      },
+      {
+        "test": "PINNED_MEMORY",
+        "settings": "queue 5-10 renders and watch system RAM",
+        "goal": "only enable --disable-pinned-memory if memory keeps growing / allocations fail"
+      }
+    ],
+    "profile_env_for_debug": {
+      "MINIMAX_SP_PROFILE": "1",
+      "MINIMAX_SP_PROFILE_OPS": "1"
+    }
+  },
+  "do_not_do": [
+    "Do not use MiniMaxH3SPVAEDecode on 24GB 3090 cards with ~21GB FP8 DiT.",
+    "Do not run BF16 DiT: ~40GB per card, does not fit a 24GB 3090.",
+    "Do not assume 48GB combined VRAM means one model is split by weights; Ulysses replicates the ~21GB FP8 DiT on BOTH cards.",
+    "Do not enable EasyCache + Turbo by default.",
+    "Do not stack Sage + Sol-Attn + Spectrum + Turbo + cache and call it a quality profile.",
+    "Do not enable disk cache for AudioRefine unless you explicitly accept SSD writes.",
+    "Do not use --cuda-device 0 alone when you want both GPUs; it hides GPU1.",
+    "Do not switch checkpoint/dtype/world_size without restarting the ComfyUI process."
+  ],
+  "recommended_daily_choice": {
+    "profile": "02_PRODUCTION_BALANCED",
+    "why": "2x3090 already gives strong acceleration through exact sequence parallelism, so there is no need to sacrifice image/audio quality with multiple approximate speed tricks."
+  },
+  "recommended_max_quality_choice": {
+    "profile": "03_PRODUCTION_MAX_QUALITY",
+    "settings_summary": "2GPU Ulysses SP + FP8 FL2VA + stock VAE + 1280x736 + 40 steps + er_sde + beta + no Turbo + no cache + no extra attention patch."
+  },
+  "source_workflows_to_use_as_canvas_bases": {
+    "2gpu_ready_to_import_graph": "https://github.com/buqi-code/buqi-minimax-h3-multigpu/blob/main/examples/workflow_ui_2gpu.json",
+    "audio_refine_ready_to_import_graph": "https://github.com/Adudeguyman/ComfyUI-H3-AudioRefine/blob/main/example_workflow/mmh3_audio_refiner_basic_t2v.json",
+    "lightx2v_turbo_t2v_graph": "https://github.com/ModelTC/Minimax-H3-Turbo/blob/main/example_workflows/video_minimax_h3_t2v_lightx2v_turbo.json"
+  },
+  "build_recipe": [
+    "1. Import the buqi 2GPU ready-to-import graph into ComfyUI.",
+    "2. Set MiniMaxH3SPUNETLoader: FP8 FL2VA, world_size=2, devices=auto.",
+    "3. KEEP stock VAEDecode on 3090 24GB; do not replace it with MiniMaxH3SPVAEDecode.",
+    "4. Use Qwen3-VL NVFP4 text encoder and official H3 video/audio VAEs.",
+    "5. Save three copies of the graph: PREVIEW_FAST, PRODUCTION_BALANCED, PRODUCTION_MAX_QUALITY.",
+    "6. In PREVIEW_FAST add only the LightX2V Turbo LoRA and its documented step/shift settings.",
+    "7. Keep PRODUCTION_BALANCED/MAX_QUALITY free of Turbo/EasyCache/extra attention patches at first.",
+    "8. For AudioRefine, import its own example graph into a separate workflow; validate without SP first.",
+    "9. Only after stable A/B testing merge optional optimizations one at a time.",
+    "10. Save a clean baseline workflow that you never modify; use it as quality reference."
+  ]
+}
